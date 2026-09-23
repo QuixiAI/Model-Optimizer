@@ -17,4 +17,5 @@
 
 from .gemm_registry import *
 from .nvfp4_gemm import *
+from .rocm_nvfp4_gemm import *
 from .xpu_gemm import *

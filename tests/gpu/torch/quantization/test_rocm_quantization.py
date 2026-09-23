@@ -19,6 +19,8 @@ import pytest
 import torch
 
 import modelopt.torch.quantization as mtq
+from modelopt.torch.quantization.backends import enable_real_quant_gemm
+from modelopt.torch.quantization.backends.rocm_nvfp4_gemm import RocmNvfp4Linear
 from modelopt.torch.quantization.qtensor import NVFP4QTensor
 
 pytestmark = pytest.mark.skipif(torch.version.hip is None, reason="Requires ROCm PyTorch")
@@ -50,3 +52,38 @@ def test_nvfp4_fast_dequantize_uses_portable_path_on_rocm():
     result = packed.dequantize(fast=True, **kwargs)
 
     torch.testing.assert_close(result, expected)
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype"),
+    [
+        ((1, 48, 70), torch.bfloat16),
+        ((17, 128, 256), torch.float16),
+        ((2, 3, 128, 256), torch.bfloat16),
+        ((257, 128, 256), torch.bfloat16),
+    ],
+)
+def test_packed_nvfp4_gemm_on_rocm(shape, dtype):
+    pytest.importorskip("triton")
+    *leading, k, n = shape
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(torch.nn.Linear(k, n, bias=True)).to(device="cuda", dtype=dtype)
+    inputs = torch.randn(*leading, k, device="cuda", dtype=dtype)
+    mtq.quantize(model, mtq.NVFP4_DEFAULT_CFG, lambda module: module(inputs))
+    mtq.compress(model)
+    enable_real_quant_gemm(model)
+
+    outputs = model(inputs)
+    assert model[0]._real_quant_gemm_impl == RocmNvfp4Linear.apply
+
+    weight = (
+        model[0]
+        .weight.get_qtensor()
+        .dequantize(
+            scale=model[0].weight_quantizer._scale,
+            double_scale=model[0].weight_quantizer._double_scale,
+            block_sizes={-1: 16},
+        )
+    )
+    reference = torch.nn.functional.linear(model[0].input_quantizer(inputs), weight, model[0].bias)
+    torch.testing.assert_close(outputs, reference, rtol=0.02, atol=0.03)
