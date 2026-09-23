@@ -701,7 +701,7 @@ def get_model(
     # modules together for checkpoints that fit; larger ones can still spill and split a
     # tied pair, and need an explicit single-device map. Multi-GPU only: a single-GPU split
     # cannot separate a tied pair, and sequential would needlessly cap max_memory there.
-    if device != "cpu" and torch.cuda.device_count() > 1 and is_diffusion_gemma(hf_config):
+    if device.type != "cpu" and torch.cuda.device_count() > 1 and is_diffusion_gemma(hf_config):
         print(
             "Detected DiffusionGemma model. Using device_map='sequential'; the balanced "
             "'auto' mapping can split its tied encoder/decoder weights across GPUs."

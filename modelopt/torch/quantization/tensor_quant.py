@@ -266,7 +266,12 @@ def scaled_e4m3_impl(
     Returns:
         Input tensors faked quantized to FP8.
     """
-    if (not inputs.is_cuda) or amax is None or amax.squeeze().ndim > 1:
+    if (
+        (not inputs.is_cuda)
+        or torch.version.hip is not None
+        or amax is None
+        or amax.squeeze().ndim > 1
+    ):
         return fp8_eager(inputs, amax)
 
     cuda_ext_fp8 = get_cuda_ext_fp8(raise_if_failed=False)
@@ -289,7 +294,7 @@ def fake_quant_impl(
     narrow_range=True,
 ):
     """Implementation of fake quantizing input according to number of bits."""
-    if not inputs.is_cuda:
+    if not inputs.is_cuda or torch.version.hip is not None:
         return _tensor_quant(inputs, amax, num_bits, unsigned, narrow_range)
 
     cuda_ext = get_cuda_ext(raise_if_failed=False)
@@ -362,7 +367,7 @@ def _dynamic_block_quantize_impl(
         num_bits = (exponent_bits, num_bits - exponent_bits - 1)
     if num_bits in mx_format_map:
         assert scale_bits in mx_format_map, f"Scale bits should be in {mx_format_map.keys()}"
-        if not inputs.is_cuda:
+        if not inputs.is_cuda or torch.version.hip is not None:
             return _dynamic_block_quantize_eager(inputs, block_size, amax, num_bits, scale_bits)
         if scale_bits != (8, 0):
             assert amax is not None and amax.is_cuda, (

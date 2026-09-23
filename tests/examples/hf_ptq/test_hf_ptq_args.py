@@ -901,7 +901,11 @@ def test_post_quantize_export_survives_a_failed_sanity_generate(monkeypatch):
     )
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
 
-    args = SimpleNamespace(specdec_offline_dataset=None, verbose=False)
+    args = SimpleNamespace(
+        specdec_offline_dataset=None,
+        verbose=False,
+        dist_state=SimpleNamespace(device=torch.device("cpu")),
+    )
 
     with pytest.warns(UserWarning, match="Post-quantization generation sanity check failed"):
         hf_ptq.post_quantize(

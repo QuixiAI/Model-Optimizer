@@ -45,6 +45,12 @@ pip install -r requirements.txt
 For TensorRT-LLM deployment, please use the TensorRT-LLM docker image or follow their [installation docs](https://nvidia.github.io/TensorRT-LLM/installation/index.html).
 Similarly, for vLLM or SGLang deployment, please use their installation docs.
 
+### AMD ROCm / MI300X
+
+Use a ROCm build of PyTorch and install Model Optimizer from this checkout with the `hf` extra. PyTorch exposes HIP GPUs as `cuda` devices, so `--device auto` or `--device cuda` selects an MI300X; `hip` and `rocm` are not PyTorch device names. FP8, MXFP8, and NVFP4 PTQ calibration use portable quantization paths on HIP. NVFP4 on MI300X is simulated during calibration and can be packed for export; native low-bit inference depends on the deployment backend and GPU support.
+
+The TensorRT-LLM container and TensorRT-LLM export path described above are NVIDIA-specific. Use a ROCm-capable serving backend for checkpoints produced on MI300X.
+
 ## Getting Started
 
 ### 1. Quantize (Post Training Quantization)

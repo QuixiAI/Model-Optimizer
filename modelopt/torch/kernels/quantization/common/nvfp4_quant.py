@@ -26,7 +26,6 @@ FP4 (E2M1) representable magnitudes: {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
 
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import libdevice
 
 
 @triton.jit
@@ -90,7 +89,7 @@ def nvfp4_scalar_quant(
     x_abs = tl.abs(x)
     zero_scale = scale == 0.0
     scale_safe = tl.where(
-        zero_scale | libdevice.isnan(scale) | (tl.abs(scale) == float("inf")),
+        zero_scale | (scale != scale) | (tl.abs(scale) == float("inf")),  # noqa: PLR0124
         1.0,
         scale,
     )

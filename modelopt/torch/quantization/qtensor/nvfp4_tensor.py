@@ -377,7 +377,7 @@ class NVFP4QTensor(BaseQuantizedTensor):
                     "This tensor is quantized by trtllm, but tensorrt_llm cannot be imported."
                 ) from e
 
-        if fast:
+        if fast and self._quantized_data.is_cuda and torch.version.hip is None:
             from modelopt.torch.kernels.quantization.gemm.fp4_kernel import fp4_dequantize
 
             return fp4_dequantize(
