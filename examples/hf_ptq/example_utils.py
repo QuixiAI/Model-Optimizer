@@ -22,8 +22,8 @@ import json
 import logging
 import os
 import warnings
-from collections.abc import Callable, Iterable
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -47,8 +47,12 @@ from transformers import (
 
 from modelopt.recipe import load_recipe
 from modelopt.torch.export.model_utils import is_multimodal_model
-from modelopt.torch.export.plugins.hf_checkpoint_utils import copy_non_safetensor_files_from_ckpt
 from modelopt.torch.utils import is_accelerator_device, resolve_device
+from modelopt.torch.utils.plugins.hf_checkpoint_utils import (
+    copy_non_safetensor_files_from_ckpt,
+    copy_off_index_safetensors,
+)
+from modelopt.torch.utils.plugins.model_load_utils import record_unplaced_source_keys
 
 try:
     from huggingface_hub import snapshot_download
@@ -102,7 +106,11 @@ _HF_PTQ_WEIGHT_FILE_PATTERNS = (
     "*.tgz",
     "*.zip",
 )
+# Dotted like the other sidecars hf_ptq drops in the export directory, so it is ignored by
+# from_pretrained and does not look like part of the model.
+_EXPERIMENT_JSON = ".experiment.json"
 _HF_PTQ_EXPORT_OWNED_FILES = {
+    _EXPERIMENT_JSON,
     "config.json",
     "hf_quant_config.json",
     "quant_config.json",
@@ -419,142 +427,6 @@ def get_processor(
             return None
 
 
-def get_inlined_mtp_prefixes(config: Any) -> list[str]:
-    """Turn an HF config into the list of state-dict prefixes for inlined-MTP layers."""
-    # ``or 0``: some configs set num_nextn_predict_layers=None rather than omit it.
-    num_nextn = int(getattr(config, "num_nextn_predict_layers", 0) or 0)
-    if not num_nextn:
-        return []
-    num_hidden = config.num_hidden_layers
-    return [f"model.layers.{i}" for i in range(num_hidden, num_hidden + num_nextn)]
-
-
-def _keys_to_prefixes(keys: Iterable[str]) -> set[str]:
-    """Invert separate-file MTP keys into the prefixes the exporter needs for exclude_modules.
-    ``"mtp.fc.weight"`` → ``{"mtp"}``; ``"mtp.layers.0.q_proj.weight"`` →
-    ``{"mtp", "mtp.layers.0"}``. ``"model"`` top-level is dropped to avoid the
-    ``"model*"`` wildcard covering the whole backbone.
-    """
-    prefixes: set[str] = set()
-    for key in keys:
-        parts = key.split(".")
-        if parts and parts[0] != "model":
-            prefixes.add(parts[0])
-        for i, part in enumerate(parts):
-            if part == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
-                prefixes.add(".".join(parts[: i + 2]))
-                break
-    return prefixes
-
-
-def _load_tensors_matching(
-    model_dir: Path, predicate: Callable[[str], bool]
-) -> dict[str, torch.Tensor]:
-    """Stream tensors satisfying ``predicate(key)`` from every safetensors
-    source in ``model_dir`` (indexed shards + standalone files, each opened
-    at most once).
-    """
-    tensors: dict[str, torch.Tensor] = {}
-    seen_shards: set[str] = set()
-
-    index_file = model_dir / "model.safetensors.index.json"
-    if index_file.exists():
-        with open(index_file) as f:
-            weight_map = json.load(f)["weight_map"]
-        per_shard: dict[str, list[str]] = {}
-        for key, shard_name in weight_map.items():
-            if predicate(key):
-                per_shard.setdefault(shard_name, []).append(key)
-        for shard_name, keys in per_shard.items():
-            seen_shards.add(shard_name)
-            with safe_open(str(model_dir / shard_name), framework="pt", device="cpu") as f:
-                for k in keys:
-                    tensors[k] = f.get_tensor(k)
-
-    for shard in sorted(model_dir.glob("*.safetensors")):
-        if shard.name in seen_shards:
-            continue
-        with safe_open(str(shard), framework="pt", device="cpu") as f:
-            for k in f.keys():  # noqa: SIM118 - safe_open is not iterable
-                if predicate(k):
-                    tensors[k] = f.get_tensor(k)
-    return tensors
-
-
-def _apply_to_model_state_dict(
-    model: torch.nn.Module, tensors: dict[str, torch.Tensor]
-) -> dict[str, torch.Tensor]:
-    """Load tensors with a slot in ``model.state_dict()`` in-place; return the
-    rest as orphans for ``extra_state_dict``.
-    """
-    model_state = model.state_dict()
-    in_state_dict = {k: v for k, v in tensors.items() if k in model_state}
-    out_state_dict = {k: v for k, v in tensors.items() if k not in model_state}
-    if in_state_dict:
-        model.load_state_dict(in_state_dict, strict=False)
-    return out_state_dict
-
-
-def mtp_layer_prefixes_from_checkpoint(model_path: str) -> list[str]:
-    """MTP exclude-prefixes from a checkpoint's safetensors index (``[]`` if none); reads no tensors.
-
-    Local-index-only, matching :func:`load_mtp_weights`, so detection and re-attach stay in sync.
-    """
-    index_file = Path(model_path) / "model.safetensors.index.json"
-    if not index_file.exists():
-        return []
-    weight_map = json.load(open(index_file))["weight_map"]
-    mtp_keys = [k for k, v in weight_map.items() if "mtp" in k or "mtp" in v]
-    return list(_keys_to_prefixes(mtp_keys))
-
-
-def load_mtp_weights(
-    model: torch.nn.Module, model_path: str
-) -> tuple[list[str], dict[str, torch.Tensor]]:
-    """Detect and load MTP weights. Support matrix:
-
-        Convention     Architectures             On-disk shape
-        -------------  ------------------------  -------------------------------
-        inlined        GLM-5.1 (``GlmMoeDsa``),  ``model.layers.{N}.*``
-                       DeepSeek-V3
-        separate-file  GLM-4.7                   standalone ``mtp.safetensors``
-        separate-file  Qwen3-Next                indexed ``mtp.*`` tail shard
-
-    Inlined ``N`` in ``[num_hidden, num_hidden + num_nextn_predict_layers)``;
-    may be orphaned at ``from_pretrained`` time if the HF class only builds
-    ``num_hidden`` decoders.
-
-    Returns ``(prefixes, not_in_state_dict)``: ``prefixes`` populates
-    ``quantization_config.exclude_modules``; ``not_in_state_dict`` is fed to
-    ``export_hf_checkpoint(extra_state_dict=...)``.
-    """
-    model_dir = Path(model_path)
-
-    inlined_prefixes = set(get_inlined_mtp_prefixes(model.config))
-    inlined_tuple = tuple(p + "." for p in inlined_prefixes)
-
-    # Combined predicate covering both conventions in one pass.
-    def predicate(key: str) -> bool:
-        return key.startswith(inlined_tuple) or "mtp" in key
-
-    tensors = _load_tensors_matching(model_dir, predicate)
-    if not tensors:
-        return [], {}
-
-    separate_keys = [k for k in tensors if not k.startswith(inlined_tuple)]
-    prefixes = inlined_prefixes | _keys_to_prefixes(separate_keys)
-
-    not_in_state_dict = _apply_to_model_state_dict(model, tensors)
-
-    print(
-        f"✓ Detected {len(tensors)} MTP tensors under {sorted(prefixes)} "
-        f"(loaded into model: {len(tensors) - len(not_in_state_dict)}, "
-        f"orphaned: {len(not_in_state_dict)})"
-    )
-
-    return sorted(prefixes), not_in_state_dict
-
-
 def get_dtype(dtype):
     if dtype == "bf16":
         dtype = torch.bfloat16
@@ -587,7 +459,6 @@ def _unpack_compressed_linear_weights(model, ckpt_path=None):
         return
 
     from huggingface_hub import hf_hub_download
-    from safetensors import safe_open
 
     is_local = os.path.isdir(ckpt_path)
 
@@ -734,6 +605,46 @@ def _fmt_max_memory(max_memory: dict) -> str:
     return "\n".join(parts)
 
 
+def _resolved_local_dir(ckpt_path: str) -> str:
+    """Return the local directory ``ckpt_path`` names, resolving a hub id to its snapshot.
+
+    The export re-reads the source checkpoint by path to carry over the weights the loader could
+    not place. Recording the hub id instead would leave it reading ``org/model``, which is not a
+    directory -- so every carried weight would be dropped with a warning. ``from_pretrained`` has
+    already populated the cache by the time this runs, so the lookup is local and offline.
+    """
+    if Path(ckpt_path).is_dir():
+        return str(ckpt_path)
+    if snapshot_download is None:
+        return str(ckpt_path)
+    try:
+        return snapshot_download(ckpt_path, local_files_only=True)
+    except Exception:
+        # No snapshot to point at; the export falls back to its own provenance handling.
+        return str(ckpt_path)
+
+
+def _from_pretrained_recording(auto_class, ckpt_path, **kwargs):
+    """``from_pretrained`` that records what the loader could not place.
+
+    ``output_loading_info=True`` makes Transformers return its own accounting of the load;
+    ``unexpected_keys`` -- keys present in the checkpoint but not in the model's architecture --
+    is exactly the set the export has to carry over (an MTP head, an auxiliary tower). Taking it
+    from the loader means no name patterns and no second pass over the index, and it already
+    accounts for on-the-fly key conversion, which a set re-derived afterwards would have to
+    replay to avoid mistaking a renamed key for an unplaced one.
+    """
+    model, loading_info = auto_class.from_pretrained(ckpt_path, output_loading_info=True, **kwargs)
+    unexpected = loading_info.get("unexpected_keys") or []
+    record_unplaced_source_keys(model, _resolved_local_dir(ckpt_path), unexpected)
+    if unexpected:
+        print(
+            f"✓ {len(unexpected)} checkpoint key(s) the model has no parameter for "
+            f"(e.g. {min(unexpected)}); the export will carry them over unchanged."
+        )
+    return model
+
+
 def get_model(
     ckpt_path,
     device="auto",
@@ -844,7 +755,8 @@ def get_model(
         )
 
     if is_speculative(hf_config):
-        model = AutoModelForCausalLM.from_pretrained(
+        model = _from_pretrained_recording(
+            AutoModelForCausalLM,
             ckpt_path,
             device_map=device_map,
             **model_kwargs,
@@ -853,7 +765,8 @@ def get_model(
         from modelopt.torch.quantization.plugins.huggingface import patch_compressed_linear_loading
 
         with patch_compressed_linear_loading():
-            model = AutoModelForCausalLM.from_pretrained(
+            model = _from_pretrained_recording(
+                AutoModelForCausalLM,
                 ckpt_path,
                 device_map=device_map,
                 trust_remote_code=trust_remote_code,
@@ -877,7 +790,8 @@ def get_model(
         # materialization. Sequential keeps each shard's dequant on a single device
         # (the whole model lands on one GPU when it fits there).
         model_kwargs["quantization_config"] = Mxfp4Config(dequantize=True)
-        model = AutoModelForCausalLM.from_pretrained(
+        model = _from_pretrained_recording(
+            AutoModelForCausalLM,
             ckpt_path,
             device_map="cpu" if device.type == "cpu" else "sequential",
             **model_kwargs,
@@ -963,7 +877,8 @@ def get_model(
         model_kwargs2 = _apply_dtype_to_config(model_kwargs, config_dtype, architecture)
         if _disk_offload:
             model_kwargs2["offload_folder"] = offload_folder
-        model = auto_model_module.from_pretrained(
+        model = _from_pretrained_recording(
+            auto_model_module,
             ckpt_path,
             device_map=device_map,
             **model_kwargs2,
@@ -1080,6 +995,7 @@ def copy_custom_model_files(
     export_path: str,
     trust_remote_code: bool = False,
     exclude_files: Iterable[str] | None = None,
+    copy_off_index_weights: bool = True,
 ):
     """Copy source checkpoint sidecar files to an HF PTQ export.
 
@@ -1099,6 +1015,11 @@ def copy_custom_model_files(
         export_path: Path to the exported model directory
         trust_remote_code: Passed to HuggingFace model-ID resolution; does not control copying.
         exclude_files: Additional source file names to skip.
+        copy_off_index_weights: Copy safetensors the loader never opens (GLM-4.7's
+            ``mtp.safetensors``). Only the unified-HF export gives them meaning -- it seeds their
+            tensor names into ``quantization_config.ignore`` -- so a TensorRT-LLM export, whose
+            checkpoint is ``rank<N>.safetensors`` plus its own ``config.json``, should pass False
+            rather than carry gigabytes nothing there reads.
     """
     # Resolve the source path (handles both local paths and HF model IDs)
     resolved_source_path = _resolve_model_path(source_path, trust_remote_code)
@@ -1131,12 +1052,40 @@ def copy_custom_model_files(
         exclude_patterns=_HF_PTQ_WEIGHT_FILE_PATTERNS,
     )
 
+    # Safetensors the loader never opens are sidecars too: untouched by quantization and absent
+    # from the export, so copy them rather than leave them behind. Skipped by the call above,
+    # which excludes every *.safetensors to avoid re-emitting the unquantized source weights.
+    copied_weights = (
+        copy_off_index_safetensors(source_dir, export_dir) if copy_off_index_weights else []
+    )
+    copied_files = [*copied_files, *copied_weights]
     if copied_files:
         for file_name in copied_files:
             print(f"Copied checkpoint sidecar file: {file_name}")
         print(f"Successfully copied {len(copied_files)} checkpoint sidecar files to {export_path}")
     else:
         print("No checkpoint sidecar files found to copy")
+
+
+def save_source_config(args, export_path) -> None:
+    """Copy the source model's config to the export path, for VLMs the exporters skip."""
+    print(f"Saving original model config to {export_path}")
+    config_kwargs = {"trust_remote_code": args.trust_remote_code}
+    if args.attn_implementation is not None:
+        config_kwargs["attn_implementation"] = args.attn_implementation
+    AutoConfig.from_pretrained(args.pyt_ckpt_path, **config_kwargs).save_pretrained(export_path)
+
+
+def save_processor_config(args, export_path) -> None:
+    """Copy the processor config, without which a VLM checkpoint cannot preprocess images."""
+    try:
+        print(f"Saving processor config to {export_path}")
+        AutoProcessor.from_pretrained(
+            args.pyt_ckpt_path, trust_remote_code=args.trust_remote_code
+        ).save_pretrained(export_path)
+    except Exception as e:
+        print(f"Warning: Could not save processor config: {e}")
+        print("This is normal for some VLM architectures that don't use AutoProcessor")
 
 
 def _layerwise_blocks(algorithm) -> list[dict]:
@@ -1293,9 +1242,11 @@ def add_mlflow_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Track this run on an MLflow server (e.g. https://<your-mlflow-server>/), "
             "uploading the command, the resolved recipe, the run log and the quantization "
-            "summaries. MLflow's own $MLFLOW_TRACKING_URI enables tracking without this "
-            "flag, which overrides it. A URI taken from the environment is best-effort: if "
-            "it is unusable the run warns and continues untracked."
+            "summaries, and writing .experiment.json into --export_path so the checkpoint "
+            "names the run that produced it. MLflow's own $MLFLOW_TRACKING_URI enables "
+            "tracking without this flag, which overrides it. A URI taken from the "
+            "environment is best-effort: if it is unusable the run warns and continues "
+            "untracked."
         ),
     )
     parser.add_argument(
@@ -1337,7 +1288,14 @@ def resolve_mlflow_args(args: argparse.Namespace, parser: argparse.ArgumentParse
 
 
 _MLFLOW_NON_PARAM_ARGS = frozenset(
-    {"dist_state", "mlflow", "mlflow_experiment", "mlflow_required", "mlflow_run_name"}
+    {
+        "checkpoint_exported",
+        "dist_state",
+        "mlflow",
+        "mlflow_experiment",
+        "mlflow_required",
+        "mlflow_run_name",
+    }
 )
 
 
@@ -1366,19 +1324,81 @@ def _mlflow_logger(args: argparse.Namespace) -> MlflowRunLogger:
     )
 
 
-def mlflow_run(args: argparse.Namespace) -> AbstractContextManager:
-    """Track this invocation for the duration of the block, or do nothing if untracked."""
+@contextmanager
+def mlflow_run(args: argparse.Namespace) -> Iterator[None]:
+    """Track this invocation for the duration of the block, and keep the checkpoint's
+    provenance pointer honest whether or not the run is tracked."""
     logger = _mlflow_logger(args)
+    export_path = Path(args.export_path)
     if not logger.enabled:
         # Gathering the inputs re-reads the recipe, so keep it off the untracked path.
-        return nullcontext()
+        try:
+            yield
+        finally:
+            _drop_inherited_experiment_json(args, export_path)
+        return
     params, texts = _mlflow_run_inputs(args)
-    return logger.track(
+    with logger.track(
         params=params,
         tags=_mlflow_run_tags(args),
         texts=texts,
         files=_mlflow_run_outputs(args),
-    )
+    ):
+        try:
+            yield
+        finally:
+            _log_experiment_json(logger, args, export_path)
+
+
+def _log_experiment_json(
+    logger: MlflowRunLogger, args: argparse.Namespace, export_path: Path
+) -> None:
+    """Record which MLflow run produced this checkpoint, in the checkpoint and on the server.
+
+    The tags point from the run to the checkpoint it wrote; this file is the reverse, so a
+    checkpoint found on disk can be traced back to the run that quantized it without
+    searching the server.
+
+    The artifact goes up for any run that opened, so a failure is traceable from the server
+    side. The local copy is written only once ``export_quantized`` has returned, because the
+    file claims authorship of the checkpoint sitting next to it: ``--export_path`` existing
+    proves nothing, since ``print_quant_summary`` creates it before quantization and the
+    directory may hold a valid checkpoint from an earlier attempt whose weights this run
+    never touched.
+
+    There is nothing to record at all when the run never opened, which a URI taken from the
+    environment reaches by design: it disables tracking from inside the block rather than
+    failing the quantization.
+    """
+    info = logger.run_info
+    if not info:
+        return
+    text = json.dumps(info, indent=2) + "\n"
+    logger.log_text(_EXPERIMENT_JSON.removeprefix("."), text)
+    if not args.checkpoint_exported:
+        return
+    try:
+        (export_path / _EXPERIMENT_JSON).write_text(text)
+    except OSError as e:
+        print(f"[mlflow] WARNING: could not write {export_path / _EXPERIMENT_JSON}: {e}")
+
+
+def _drop_inherited_experiment_json(args: argparse.Namespace, export_path: Path) -> None:
+    """Remove a pointer an untracked export would otherwise inherit.
+
+    A fresh checkpoint written into a reused ``--export_path`` would keep the previous run's
+    pointer, and one quantized from a tracked source checkpoint could be handed that
+    source's pointer. Either way the file would name a run that did not produce these
+    weights. Only a completed export clears it; a failed run leaves whatever checkpoint was
+    already there, pointer included.
+    """
+    if not args.checkpoint_exported or not args.dist_state.is_main:
+        return
+    stale = export_path / _EXPERIMENT_JSON
+    try:
+        stale.unlink(missing_ok=True)
+    except OSError as e:
+        print(f"Warning: could not remove stale {stale}: {e}")
 
 
 def _mlflow_run_tags(args: argparse.Namespace) -> dict[str, str]:

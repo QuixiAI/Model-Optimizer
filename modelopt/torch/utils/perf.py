@@ -25,6 +25,7 @@ from .device import (
     accelerator_synchronize,
     get_accelerator_memory_info,
     get_accelerator_memory_stats,
+    is_accelerator_device,
     resolve_device,
 )
 from .logging import print_rank_0
@@ -36,6 +37,7 @@ __all__ = [
     "get_accelerator_memory_stats",
     "get_cuda_memory_stats",
     "get_used_gpu_mem_fraction",
+    "maybe_clear_cuda_cache",
     "report_memory",
 ]
 
@@ -46,6 +48,32 @@ def clear_cuda_cache():
     The CUDA-specific name is retained for backward compatibility.
     """
     accelerator_empty_cache()
+
+
+_EMPTY_CACHE_CHECK_EVERY = 64
+_empty_cache_calls = 0
+
+
+def maybe_clear_cuda_cache(slack_bytes: int = 4 * 1024**3, device: DeviceLike = "auto") -> None:
+    """Clear the accelerator cache periodically when there is enough slack to reclaim.
+
+    ``empty_cache()`` syncs the device and hands cached blocks back to the driver, so calling it
+    after every packed weight costs more than it saves. The counter restarts on each check, so the
+    interval is measured from the last one rather than from process start. A caller that makes
+    fewer than ``_EMPTY_CACHE_CHECK_EVERY`` calls may not reclaim at all -- use
+    :func:`clear_cuda_cache` if you need a guaranteed one.
+    """
+    global _empty_cache_calls
+    _empty_cache_calls += 1
+    if _empty_cache_calls < _EMPTY_CACHE_CHECK_EVERY:
+        return
+    _empty_cache_calls = 0
+    if not is_accelerator_device(device):
+        return
+    device = resolve_device(device)
+    stats = get_accelerator_memory_stats(device)
+    if stats.get("reserved", 0) - stats.get("allocated", 0) > slack_bytes:
+        accelerator_empty_cache(device)
 
 
 def get_cuda_memory_stats(device=None):
