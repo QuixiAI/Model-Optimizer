@@ -35,6 +35,17 @@ from modelopt.torch.quantization.config import QuantizeConfig
 _EXAMPLES_DIR = Path(__file__).resolve().parents[3] / "examples" / "hf_ptq"
 
 
+@pytest.fixture(autouse=True)
+def clean_env(monkeypatch):
+    """Pin what the tracking reads from the environment.
+
+    ``resolve_tracking_uri`` consults $MLFLOW_TRACKING_URI, so a developer shell or runner
+    that exports it -- exactly the population this feature is built for -- would otherwise
+    flip the tracked/untracked branch under test. Tests that want the variable set it.
+    """
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+
+
 def _import_hf_ptq(monkeypatch):
     monkeypatch.syspath_prepend(str(_EXAMPLES_DIR))
     return importlib.import_module("hf_ptq")
@@ -467,7 +478,7 @@ def test_an_unusable_environment_uri_warns_instead_of_failing(monkeypatch):
     unlike an explicit --mlflow, which is an unambiguous request."""
     monkeypatch.setenv("MLFLOW_TRACKING_URI", "file:///local/mlruns")
 
-    with pytest.warns(UserWarning, match="Ignoring MLFLOW_TRACKING_URI"):
+    with pytest.warns(UserWarning, match=r"Ignoring \$MLFLOW_TRACKING_URI"):
         _, args = _parse_hf_ptq_args(monkeypatch, "--pyt_ckpt_path", "/models/Qwen3-0.6B")
 
     assert args.mlflow is None
@@ -732,12 +743,13 @@ def test_no_local_pointer_when_the_export_never_completed(
     assert fake_mlflow.status == "FAILED"
 
 
-def test_no_experiment_json_when_optional_tracking_fails(
+def test_a_completed_export_clears_the_pointer_when_optional_tracking_fails(
     monkeypatch, example_utils, fake_mlflow, tmp_path
 ):
     """A URI from $MLFLOW_TRACKING_URI is best-effort: an unreachable server disables
-    tracking from inside the block, and the run must not drop a contentless file on top of
-    a previous run's pointer in a reused --export_path."""
+    tracking from inside the block. No contentless file is written -- but the export did
+    complete, so a previous run's pointer in a reused --export_path must not survive next
+    to weights it did not produce, exactly as on the untracked path."""
     monkeypatch.setattr(getpass, "getuser", lambda: "tester")
     monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.com")
 
@@ -756,7 +768,8 @@ def test_no_experiment_json_when_optional_tracking_fails(
         _exported(args)
 
     assert args.mlflow_required is False
-    assert json.loads(previous.read_text())["run_id"] == "from-an-earlier-run"
+    assert not previous.exists()
+    assert "experiment.json" not in fake_mlflow.texts
 
 
 def test_untracked_export_drops_a_pointer_it_would_otherwise_inherit(
@@ -811,7 +824,7 @@ def test_only_the_main_rank_clears_an_inherited_pointer(monkeypatch, example_uti
 def test_experiment_json_is_export_owned(example_utils):
     """copy_custom_model_files copies source sidecars including dotfiles, so without this
     the source checkpoint's pointer would follow it into every derived checkpoint."""
-    assert example_utils._EXPERIMENT_JSON in example_utils._HF_PTQ_EXPORT_OWNED_FILES
+    assert example_utils.EXPERIMENT_JSON in example_utils._HF_PTQ_EXPORT_OWNED_FILES
 
 
 def test_untracked_runs_write_no_experiment_json(monkeypatch, example_utils, tmp_path):

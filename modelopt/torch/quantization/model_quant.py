@@ -39,7 +39,7 @@ from modelopt.torch.quantization.conversion import (
 from modelopt.torch.utils import atomic_print
 
 from ._auto_quantize_cost import COST_MODEL_KV_CACHE
-from .algorithms import AutoQuantizeGradientSearcher, AutoQuantizeKLDivSearcher, QuantRecipe
+from .algorithms import AUTO_QUANTIZE_SEARCHERS, QuantRecipe
 from .algorithms import get_auto_quantize_config as _get_auto_quantize_config
 from .config import QuantizeAlgoCfgType
 from .kv_cache_auto_quant import AutoQuantizeKVSearcher, get_kv_cache_auto_quantize_config
@@ -378,6 +378,24 @@ def _process_quantization_formats(formats, custom_name_prefix):
     return processed
 
 
+def _parse_auto_quantize_method(
+    method: str | dict[str, Any] | None,
+) -> tuple[str | None, dict[str, Any]]:
+    """Split an AutoQuantize method config into its name and method-specific options."""
+    if method is None or isinstance(method, str):
+        return method, {}
+    if not isinstance(method, dict):
+        raise TypeError(f"`method` must be a string or dict, got {type(method).__name__}.")
+    if "method" not in method:
+        raise ValueError("An AutoQuantize method dictionary must contain a 'method' key.")
+
+    method_config = dict(method)
+    method_name = method_config.pop("method")
+    if not isinstance(method_name, str):
+        raise TypeError("The 'method' value in an AutoQuantize method dictionary must be a string.")
+    return method_name, method_config
+
+
 def _auto_quantize_kv_cache(
     model: nn.Module,
     constraints: dict[str, Any],
@@ -488,7 +506,7 @@ def auto_quantize(
     num_calib_steps: int = 512,
     num_score_steps: int = 128,
     verbose: bool = False,
-    method: str | None = None,
+    method: str | dict[str, Any] | None = None,
     checkpoint: str | None = None,
     module_search_spaces: list[dict[str, Any]] | None = None,
     fixed_quantization_config: dict[str, Any] | str | None = None,
@@ -496,8 +514,9 @@ def auto_quantize(
     r"""Perform optimal per-layer quantization by searching for the best quantization formats per-layer.
 
     ``auto_quantize`` uses sensitivity scores to rank the per-layer quantization formats and search
-    for the best quantization formats per-layer. The sensitivity score can be computed using gradient-based
-    methods (default) or KL divergence loss, controlled by the ``method`` parameter.
+    for the best quantization formats per-layer. The sensitivity score can be computed with
+    gradient-based methods (default), KL divergence loss, or Aumann-Shapley path-integral
+    attributions, controlled by the ``method`` parameter.
 
     Internally this API runs two main phases:
 
@@ -652,11 +671,21 @@ def auto_quantize(
             A higher value could increase the time taken for performing ``auto_quantize``; reducing it speeds up the
             sensitivity score estimation phase and typically affects accuracy less than lowering ``num_calib_steps``.
         verbose: If True, prints the search progress/intermediate results.
-        method: Method to use for estimating sensitivity loss. Higher loss indicates greater sensitivity
-            to quantization. Options are ``"gradient"`` (default; uses gradient-based loss estimation,
-            linear programming search, and requires ``loss_func`` or ``forward_backward_step``) and
-            ``"kl_div"`` (uses KL divergence between unquantized and quantized outputs, relies on
-            threshold-based binary search, and only requires ``forward_step`` returning logits).
+        method: Method to use for estimating sensitivity loss, either as a string or a dictionary
+            whose ``"method"`` entry selects the method and whose remaining entries configure it.
+            Higher loss indicates greater sensitivity to quantization. Options are ``"gradient"``
+            (default; uses gradient-based loss estimation, linear programming search, and requires
+            ``loss_func`` or ``forward_backward_step``), ``"kl_div"`` (uses KL divergence between
+            unquantized and quantized outputs, relies on threshold-based binary search, and only
+            requires ``forward_step`` returning logits), and ``"aumann_shapley"`` (path-integral
+            damage attributions, calibrated against a directly measured reference point; label-free
+            like ``"kl_div"``, and additionally reports a ``predicted_damage`` estimate for the
+            selected recipe). For example, use
+            ``{"method": "aumann_shapley", "num_path_nodes": 2}`` or
+            ``{"method": "aumann_shapley", "max_predicted_damage": 1e-3}``. Scoring passes grow
+            with the number of candidate formats and path nodes, not with the number of whole-model
+            configurations the search considers -- see
+            :mod:`modelopt.torch.quantization._auto_quantize_shapley`.
         checkpoint: (Optional) Path to checkpoint file for saving/restoring auto_quantize search state.
             If the checkpoint file exists, the search state will be restored from it, skipping the
             expensive score estimation step.
@@ -726,10 +755,13 @@ def auto_quantize(
             raise TypeError("`quantization_formats` must be a sequence of formats.")
         quantization_formats = list(quantization_formats)
 
+    method_name, method_config = _parse_auto_quantize_method(method)
     is_kv_search = constraints is not None and constraints.get("cost_model") == COST_MODEL_KV_CACHE
     if is_kv_search:
         assert constraints is not None
         assert quantization_formats is not None
+        if method_config:
+            raise ValueError("cost_model='kv_cache' does not accept method-specific options.")
         return _auto_quantize_kv_cache(
             model,
             constraints,
@@ -742,13 +774,13 @@ def auto_quantize(
             num_calib_steps=num_calib_steps,
             num_score_steps=num_score_steps,
             verbose=verbose,
-            method=method,
+            method=method_name,
             checkpoint=checkpoint,
             module_search_spaces=module_search_spaces,
             fixed_quantization_config=fixed_quantization_config,
         )
 
-    method = method or "gradient"
+    method_name = method_name or "gradient"
 
     if fixed_quantization_config is None and quantization_formats is None:
         quantization_formats = [mtq.NVFP4_AWQ_LITE_CFG, mtq.FP8_DEFAULT_CFG]
@@ -843,18 +875,12 @@ def auto_quantize(
             )
 
     # Select the appropriate searcher based on method
-    if method == "gradient":
-        searcher = AutoQuantizeGradientSearcher()
-    elif method == "kl_div":
-        searcher = AutoQuantizeKLDivSearcher()
-    else:
-        raise ValueError(f"Invalid method: {method}. Valid options are 'gradient' or 'kl_div'.")
+    if method_name not in AUTO_QUANTIZE_SEARCHERS:
+        raise ValueError(
+            f"Invalid method: {method_name}. Valid options are {sorted(AUTO_QUANTIZE_SEARCHERS)}."
+        )
+    searcher = AUTO_QUANTIZE_SEARCHERS[method_name]()
 
-    model = apply_mode(
-        model,
-        mode="auto_quantize",
-        registry=QuantizeModeRegistry,
-    )
     search_config = {
         "quantization_formats": processed_quantization_formats,
         "fixed_quantization_config": processed_fixed_quantization_config,
@@ -869,13 +895,35 @@ def auto_quantize(
         "verbose": verbose,
         "checkpoint": checkpoint,
     }
+    if method_config:
+        # Only the selected method's declared options are accepted; core inputs (loaders,
+        # steps, checkpoint, ...) cannot be overridden here.
+        invalid = set(method_config) - searcher.method_config_keys
+        if invalid:
+            raise ValueError(
+                f"Invalid options {sorted(invalid)} for method={method_name!r}. "
+                f"Supported options: {sorted(searcher.method_config_keys)}."
+            )
+        search_config.update(method_config)
+    # Validate the full search config (including method-option values and cross-field
+    # consistency with the constraints) before the model is converted, so a rejected
+    # configuration leaves the model untouched. The searcher re-sanitizes the
+    # already-sanitized config inside search(), which is a no-op.
+    search_config = searcher.sanitize_search_config(search_config)
+    search_constraints = cast("ConstraintsDict", constraints or {})
+    searcher.validate_search_input(search_constraints, search_config)
+
+    model = apply_mode(
+        model,
+        mode="auto_quantize",
+        registry=QuantizeModeRegistry,
+    )
     # Disable all quantizers; AutoQuantize will enable the needed ones
     set_quantizer_by_cfg(model, [{"quantizer_name": "*", "enable": False}])
     if processed_fixed_quantization_config is not None:
         fixed_cfg, fixed_name = processed_fixed_quantization_config
         fixed_recipe = QuantRecipe(fixed_cfg, name=fixed_name)
         set_quantizer_by_cfg(model, fixed_recipe.config.quant_cfg)
-    search_constraints = cast("ConstraintsDict", constraints or {})
     searcher.search(model, search_constraints, config=search_config)
 
     return model, searcher.state_dict()
