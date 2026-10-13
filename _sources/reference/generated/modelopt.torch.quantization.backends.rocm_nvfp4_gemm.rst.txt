@@ -1,0 +1,6 @@
+modelopt.torch.quantization.backends.rocm\_nvfp4\_gemm
+======================================================
+
+.. currentmodule:: modelopt.torch.quantization.backends
+
+.. autofunction:: rocm_nvfp4_gemm
