@@ -22,7 +22,7 @@ def test_launch_memory_monitor_returns_none_on_cpu():
     assert memory_monitor.launch_memory_monitor(device="cpu") is None
 
 
-def test_monitor_collects_all_devices_without_vendor_library(monkeypatch):
+def _fake_xpu(monkeypatch):
     monkeypatch.setattr(memory_monitor, "resolve_device", lambda device: torch.device("xpu"))
     monkeypatch.setattr(memory_monitor, "get_accelerator_device_count", lambda device: 2)
     monkeypatch.setattr(
@@ -36,6 +36,10 @@ def test_monitor_collects_all_devices_without_vendor_library(monkeypatch):
         lambda device: (25, 100) if device.index == 0 else (50, 100),
     )
 
+
+def test_monitor_collects_all_devices_without_vendor_library(monkeypatch):
+    _fake_xpu(monkeypatch)
+
     monitor = memory_monitor.AcceleratorMemoryMonitor(device="xpu")
     monkeypatch.setattr(
         memory_monitor.time,
@@ -46,6 +50,19 @@ def test_monitor_collects_all_devices_without_vendor_library(monkeypatch):
     monitor._monitor_loop()
 
     assert monitor.peak_memory == {0: 75 / 2**30, 1: 50 / 2**30}
+
+
+def test_stopping_a_stopped_monitor_does_nothing(monkeypatch, capsys):
+    """launch_memory_monitor registers stop() to run at exit, so a monitor its caller stopped is
+    stopped again then: the second stop does not report again."""
+    _fake_xpu(monkeypatch)
+    monitor = memory_monitor.launch_memory_monitor(monitor_interval=0.01, device="xpu")
+
+    monitor.stop()
+    assert "########" in capsys.readouterr().out
+    monitor.stop()
+
+    assert capsys.readouterr().out == ""
 
 
 def test_legacy_gpu_monitor_name_is_preserved():

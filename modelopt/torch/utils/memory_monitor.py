@@ -41,6 +41,7 @@ class AcceleratorMemoryMonitor:
         self.peak_memory: dict[int, float] = {}
         self.is_running = False
         self.monitor_thread: threading.Thread | None = None
+        self._stopped = False
 
     def _monitor_loop(self):
         while self.is_running:
@@ -60,8 +61,18 @@ class AcceleratorMemoryMonitor:
         self.monitor_thread.start()
 
     def stop(self):
-        """Stop monitoring and print peak memory use for each device."""
+        """Stop monitoring and print peak memory use for each device.
+
+        Stopping a stopped monitor does nothing, as when a caller stops it and the exit hook
+        :func:`launch_memory_monitor` registered runs too.
+        """
+        if self._stopped:
+            return
+        self._stopped = True
         self.is_running = False
+        # The thread can be inside a sampling pass, still adding to peak_memory: let it finish first.
+        if self.monitor_thread:
+            self.monitor_thread.join()
         print("########")
         for device_index, peak_memory in self.peak_memory.items():
             print(
@@ -69,8 +80,6 @@ class AcceleratorMemoryMonitor:
                 f"{peak_memory:.2f} GB for all processes on the device"
             )
         print("########")
-        if self.monitor_thread:
-            self.monitor_thread.join()
 
 
 # Backward-compatible name for callers that imported the old NVML-specific class.

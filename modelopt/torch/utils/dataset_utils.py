@@ -25,7 +25,6 @@ from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-import requests
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -39,6 +38,7 @@ from .device import (
     resolve_device,
     with_device_index,
 )
+from .distributed import all_reduce, recorded_distribution_plan
 from .logging import print_rank_0, warn_rank_0
 from .network import get_module_device
 
@@ -897,6 +897,8 @@ def get_dataset_dataloader(
         all_samples,
         return_tensors="pt",
         padding=True,
+        # Left padding creates fully masked causal rows, which can yield NaNs in cuDNN backward.
+        padding_side="right" if include_labels else None,
         truncation=True,
         max_length=max_sample_length,
     )
@@ -1008,30 +1010,83 @@ def get_max_batch_size(
     sample_memory_usage_ratio: float = 1.0,
     sample_input_single_batch: torch.Tensor | None = None,
     enable_grad: bool = False,
+    forward_step: Callable[[torch.nn.Module, torch.Tensor], Any] | None = None,
 ):
-    """Get the maximum batch size that can be used for the model."""
+    """Get the maximum batch size that can be used for the model.
+
+    ``forward_step(model, inputs)`` optionally probes a custom workload, including during
+    OOM retries. By default, probe a model forward (or generation for encoder-decoder models).
+
+    For a model whose recorded plan spans several ranks
+    (:func:`~modelopt.torch.utils.distributed.set_distribution_plan`), every rank must call it, and
+    every rank gets the same size: the smallest that each rank estimates from one forward on the
+    device it computes on. That estimate is not retried on out-of-memory; if it does not fit, pass
+    an explicit batch size. A model with no plan recorded is measured on every visible device.
+    """
+    args = (
+        model,
+        max_sample_length,
+        sample_memory_usage_ratio,
+        sample_input_single_batch,
+        enable_grad,
+        forward_step,
+    )
+    plan = recorded_distribution_plan(model)
+    if plan is not None and plan.world_size > 1:
+        # The smallest estimate gives every rank the same number of calibration steps. It is not
+        # probed: a rank retrying a smaller batch after an out-of-memory error would run more
+        # forwards, and their collectives, than its peers, and one that runs out of memory partway
+        # through a forward leaves them waiting in its collectives.
+        # The device this rank computes on, which LOCAL_RANK does not name under a launcher that
+        # shows each rank one device.
+        accelerator = resolve_device("auto")
+        device = (
+            with_device_index(accelerator, torch.accelerator.current_device_index())
+            if accelerator.type != "cpu"
+            else accelerator
+        )
+        return all_reduce("calib_batch_size", lambda: _max_batch_size(*args, device=device), min)
+    return _max_batch_size(*args)
+
+
+def _max_batch_size(
+    model: torch.nn.Module,
+    max_sample_length: int,
+    sample_memory_usage_ratio: float,
+    sample_input_single_batch: torch.Tensor | None,
+    enable_grad: bool,
+    forward_step: Callable[[torch.nn.Module, torch.Tensor], Any] | None,
+    device: torch.device | None = None,
+) -> int:
+    """:func:`get_max_batch_size` measured on ``device`` with one probe, or on every visible device."""
     model_device = resolve_device(
         sample_input_single_batch.device
         if sample_input_single_batch is not None
         else get_module_device(model)
     )
+    devices = (
+        [
+            with_device_index(model_device, device_index)
+            for device_index in range(get_accelerator_device_count(model_device))
+        ]
+        if device is None
+        else [device]
+    )
 
     def _get_free_accelerator_mem():
-        device_count = get_accelerator_device_count(model_device)
-        if device_count == 0:
-            return None
         min_free_mem = None
         max_allocated_mem = 0
-        for device_index in range(device_count):
-            device = with_device_index(model_device, device_index)
-            memory_info = get_accelerator_memory_info(device)
+        for accelerator_device in devices:
+            memory_info = get_accelerator_memory_info(accelerator_device)
             if memory_info is None:
                 return None
             free_mem, _ = memory_info
             if min_free_mem is None or free_mem < min_free_mem:
                 min_free_mem = free_mem
-                max_allocated_mem = get_accelerator_memory_stats(device)["max_allocated"]
-        return min_free_mem, max_allocated_mem
+                max_allocated_mem = get_accelerator_memory_stats(accelerator_device)[
+                    "max_allocated"
+                ]
+        return None if min_free_mem is None else (min_free_mem, max_allocated_mem)
 
     accelerator_empty_cache(model_device)
 
@@ -1039,7 +1094,12 @@ def get_max_batch_size(
     is_enc_dec = model_type_is_enc_dec(model)
     # Call the module (not .forward) so nn.Module.__call__ runs pre/post-forward hooks — this is how
     # FSDP2 unshards/reshards a sharded root. generate() also calls the module internally.
-    infer_method = model.generate if is_enc_dec else model
+    if forward_step is None:
+        infer_method = model.generate if is_enc_dec else model
+    else:
+
+        def infer_method(inputs):
+            return forward_step(model, inputs)
 
     if sample_input_single_batch is None:
         sample_input_single_batch = (
@@ -1077,27 +1137,27 @@ def get_max_batch_size(
         else:
             target_data_batch = max(int(free_mem_before / mem_diff_per_data_batch), 1)
 
-        def _expand_to(batch: int) -> torch.Tensor:
-            return sample_input_single_batch.expand(
-                [
-                    batch if index == 0 else dim
-                    for index, dim in enumerate(sample_input_single_batch.shape)
-                ]
-            )
-
-        target_input = _expand_to(target_data_batch)
-
         # For some models on multi GPU, we observe the memory per batch is not a constant.
-        # So we just test the target batch size and make sure we do not go OOM.
-        while target_data_batch > 1:
-            with torch.set_grad_enabled(enable_grad):
-                try:
-                    infer_method(target_input)
-                    break
-                except torch.OutOfMemoryError:  # pragma: no cover - accelerator OOM retry path
-                    target_data_batch = target_data_batch // 2  # pragma: no cover
-                    target_input = _expand_to(target_data_batch)  # pragma: no cover
-                    accelerator_empty_cache(model_device)  # pragma: no cover
+        # So we just test the target batch size and make sure we do not go OOM. A model distributed
+        # over several ranks is measured once, not probed (see get_max_batch_size).
+        if device is None:
+
+            def _expand_to(batch: int) -> torch.Tensor:
+                return sample_input_single_batch.expand(
+                    [
+                        batch if index == 0 else dim
+                        for index, dim in enumerate(sample_input_single_batch.shape)
+                    ]
+                )
+
+            while target_data_batch > 1:
+                with torch.set_grad_enabled(enable_grad):
+                    try:
+                        infer_method(_expand_to(target_data_batch))
+                        break
+                    except torch.OutOfMemoryError:  # pragma: no cover - accelerator OOM retry path
+                        target_data_batch = target_data_batch // 2  # pragma: no cover
+                        accelerator_empty_cache(model_device)  # pragma: no cover
 
     # Regulate the data batch target to be 1, 2, 4, 8, 12, ..., capped at 64
     if target_data_batch < 2:
@@ -1110,8 +1170,38 @@ def get_max_batch_size(
         return 512
 
 
+def _slice_batch(batch_data, start, end):
+    """Return rows [start, end) of a batch, leaving None entries as they are.
+
+    Args:
+        batch_data: Dictionary containing the batch data
+        start: First row of the slice
+        end: One past the last row of the slice
+
+    Returns:
+        A dictionary holding the slice
+    """
+    sliced = {}
+    for key, data in batch_data.items():
+        if data is None:
+            sliced[key] = None
+        elif torch.is_tensor(data):
+            sliced[key] = data[start:end, ...]
+        else:
+            raise ValueError(
+                f"Cannot split a batch holding the non-tensor key '{key}'. Its rows cannot be "
+                "sliced, so a sub-batch would not line up with the inputs. Reduce the "
+                "dataloader's batch size so the batch fits without splitting."
+            )
+    return sliced
+
+
 def _process_batch(
-    batch_data, infer_method, max_working_batch_size=None, allowed_non_tensor_keys=None
+    batch_data,
+    infer_method,
+    max_working_batch_size=None,
+    allowed_non_tensor_keys=None,
+    split_on_oom=True,
 ):
     """Process a batch of data through the model's inference method.
 
@@ -1120,6 +1210,8 @@ def _process_batch(
         infer_method: Model's inference method (either forward or generate)
         max_working_batch_size: Maximum batch size known to work without OOM
         allowed_non_tensor_keys: Set of key names whose values may be non-tensor types
+        split_on_oom: Whether a batch that runs out of GPU memory is retried as two halves;
+            otherwise the error is raised
 
     Returns:
         The maximum batch size that worked successfully
@@ -1134,19 +1226,21 @@ def _process_batch(
 
     # If we know a smaller batch size works, preemptively split
     if max_working_batch_size is not None and batch_size > max_working_batch_size:
-        # Split the batch to avoid OOM
-        for i in range(0, batch_size, max_working_batch_size):
-            end_idx = min(i + max_working_batch_size, batch_size)
-            split_data = {}
-            for key in batch_data:
-                if batch_data[key] is None:
-                    split_data[key] = None
-                else:
-                    split_data[key] = batch_data[key][i:end_idx, ...]
-
+        # Walk by the width actually used: a recursive call can come back with a
+        # smaller size than this walk started with, and a stride fixed up front
+        # would then step over the rows between the two widths.
+        offset = 0
+        while offset < batch_size:
+            width = min(max_working_batch_size, batch_size - offset)
+            split_data = _slice_batch(batch_data, offset, offset + width)
             max_working_batch_size = _process_batch(
-                split_data, infer_method, max_working_batch_size, allowed_non_tensor_keys
+                split_data,
+                infer_method,
+                max_working_batch_size,
+                allowed_non_tensor_keys,
+                split_on_oom,
             )
+            offset += width
 
         return max_working_batch_size
 
@@ -1159,6 +1253,8 @@ def _process_batch(
             else max(batch_size, max_working_batch_size)
         )  # This batch size worked successfully
     except torch.OutOfMemoryError:
+        if not split_on_oom:
+            raise
         assert batch_size > 1, (
             "Out of memory while processing a single sample. "
             "This indicates the model is too large for the available device memory. "
@@ -1169,8 +1265,8 @@ def _process_batch(
     # Split the batch in half
     mid = (batch_size + 1) // 2
     warn_rank_0(f"Out of memory with batch size {batch_size}, trying with batch size {mid}")
-    split_data_1 = {key: batch_data[key][:mid, ...] for key in batch_data}
-    split_data_2 = {key: batch_data[key][mid:, ...] for key in batch_data}
+    split_data_1 = _slice_batch(batch_data, 0, mid)
+    split_data_2 = _slice_batch(batch_data, mid, batch_size)
 
     # Recursively process each half and track max working batch size
     max_working_batch_size = _process_batch(
@@ -1196,6 +1292,11 @@ def _forward_loop(
         dataloader: DataLoader containing the batched input data
         allowed_non_tensor_keys: Set of key names whose values may be non-tensor types
     """
+    # A batch that runs out of GPU memory is retried in halves, except for a model whose recorded plan
+    # spans several ranks: its forward can hold collectives, and a rank that retried would run more
+    # forwards than its peers, which would wait in them.
+    plan = recorded_distribution_plan(model)
+    split_on_oom = plan is None or plan.world_size == 1
     with _disable_use_cache(model), torch.no_grad():
         is_enc_dec = model_type_is_enc_dec(model)
         # Call the module (not .forward) so nn.Module.__call__ runs pre/post-forward hooks — this is
@@ -1206,7 +1307,7 @@ def _forward_loop(
         for _, data in enumerate(tqdm(dataloader)):
             # Process batch and update max working batch size
             max_working_batch_size = _process_batch(
-                data, infer_method, max_working_batch_size, allowed_non_tensor_keys
+                data, infer_method, max_working_batch_size, allowed_non_tensor_keys, split_on_oom
             )
 
 
@@ -1322,6 +1423,7 @@ def download_hf_dataset_as_jsonl(
     Returns:
         List of paths to downloaded JSONL files.
     """
+    import requests
     from datasets import load_dataset
     from huggingface_hub.utils import build_hf_headers
 

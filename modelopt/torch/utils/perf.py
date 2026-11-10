@@ -18,6 +18,8 @@
 import time
 from contextlib import ContextDecorator
 
+import torch
+
 from . import distributed as dist
 from .device import (
     DeviceLike,
@@ -35,7 +37,9 @@ __all__ = [
     "Timer",
     "clear_cuda_cache",
     "get_accelerator_memory_stats",
+    "get_available_gpu_memory",
     "get_cuda_memory_stats",
+    "get_process_gpus",
     "get_used_gpu_mem_fraction",
     "maybe_clear_cuda_cache",
     "report_memory",
@@ -100,6 +104,25 @@ def get_used_gpu_mem_fraction(device: DeviceLike = "auto"):
 
     free_memory, total_memory = memory_info
     return (total_memory - free_memory) / total_memory if total_memory > 0 else 0.0
+
+
+def get_process_gpus() -> list[int]:
+    """GPUs this process already holds memory on; querying any other would create a context on it."""
+    return [i for i in range(torch.cuda.device_count()) if torch.cuda.memory_reserved(i)]
+
+
+def get_available_gpu_memory(gpu: int) -> int:
+    """Bytes a new allocation on ``gpu`` can get: the driver's free memory and our cached blocks.
+
+    Free pieces of partly used cached blocks are left out: a large allocation cannot use them,
+    and PyTorch cannot hand them back to the driver.
+    """
+    free, _ = torch.cuda.mem_get_info(gpu)
+    stats = torch.cuda.memory_stats(gpu)
+    cached = stats.get("reserved_bytes.all.current", 0) - stats.get(
+        "allocated_bytes.all.current", 0
+    )
+    return free + cached - stats.get("inactive_split_bytes.all.current", 0)
 
 
 def report_memory(name="", rank=0, device=None):
